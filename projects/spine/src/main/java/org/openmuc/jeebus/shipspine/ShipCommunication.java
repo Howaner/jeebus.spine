@@ -37,6 +37,11 @@ import java.util.function.Function;
 import static org.openmuc.jeebus.ship.api.DisconnectReason.ERROR;
 import static org.openmuc.jeebus.ship.util.ShipUtilities.beautify;
 import static org.openmuc.jeebus.ship.util.ShipUtilities.safelyParseSocketAddress;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+
 import static org.openmuc.jeebus.shipspine.ShipCommunication.ConnectClientsTo.ALL;
 import static org.openmuc.jeebus.shipspine.ShipCommunication.ConnectClientsTo.TRUSTED;
 
@@ -100,6 +105,13 @@ public class ShipCommunication extends Communication {
     @Override
     public boolean isConnected() {
         return connected;
+    }
+
+    public List<ShipConnectionInfoSnapshot> getConnectionInfos() {
+        if (ship == null) {
+            return new ArrayList<>();
+        }
+        return ship.getConnectionInfos();
     }
 
     @Override
