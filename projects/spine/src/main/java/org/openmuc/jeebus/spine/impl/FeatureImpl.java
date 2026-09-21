@@ -10,28 +10,38 @@
 
 package org.openmuc.jeebus.spine.impl;
 
-import org.openmuc.jeebus.spine.api.Error;
 import org.openmuc.jeebus.spine.api.*;
+import org.openmuc.jeebus.spine.api.Error;
 import org.openmuc.jeebus.spine.impl.parser.MessageParser;
-import org.openmuc.jeebus.spine.spi.*;
+import org.openmuc.jeebus.spine.spi.BindingListener;
+import org.openmuc.jeebus.spine.spi.FeaturePermission;
+import org.openmuc.jeebus.spine.spi.SpineConnection;
+import org.openmuc.jeebus.spine.spi.SpineSubscription;
 import org.openmuc.jeebus.spine.spi.function.FeatureFunction;
+import org.openmuc.jeebus.spine.utils.SpineUtilities;
 import org.openmuc.jeebus.spine.xsd.v1.*;
+import org.openmuc.jeebus.spine.xsd.v1.NodeManagementBindingRequestCallType.BindingRequest;
+import org.openmuc.jeebus.spine.xsd.v1.NodeManagementSubscriptionRequestCallType.SubscriptionRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.*;
 
+import static org.openmuc.jeebus.spine.impl.SubscriptionWrapper.State.PENDING;
+import static org.openmuc.jeebus.spine.impl.SubscriptionWrapper.State.SUCCESSFUL;
+import static org.openmuc.jeebus.spine.utils.SpineUtilities.addressToString;
 import static org.openmuc.jeebus.spine.xsd.v1.CmdClassifierType.*;
 
 class FeatureImpl implements Feature {
     private static final Logger LOGGER = LoggerFactory.getLogger(Feature.class);
     private final Map<String, FeatureFunction> functions = new HashMap<>();
     private final FeatureAddressType address = new FeatureAddressType();
+
     private final List<FeatureAddressType> subscribers = new ArrayList<>();
-    private final Map<String, List<SpineSubscription>> subscriptions
-        = new HashMap<>();
-    private final List<String> bindings = new ArrayList<>();
+    private final Map<String, SubscriptionWrapper> subscriptions
+        = new ConcurrentHashMap<>();
+
     private EntityImpl parent;
     private FeatureTypeEnumType featureType;
     private RoleType role;
@@ -43,15 +53,22 @@ class FeatureImpl implements Feature {
     private String minimumTrustLevel = null;
     private FeatureWrapper featureWrapper;
 
-    private static final Set<CmdClassifierType> ACKNOWLEDGEMENT_REQUEST_WHITELIST
-        = Set.of(WRITE, CALL);
+    private final Set<String> bindings = new ConcurrentSkipListSet<>();
+    private final ExecutorService bindingListenerExecutor
+        = Executors.newCachedThreadPool();
     private final Set<BindingListener> bindingListeners = new HashSet<>();
 
-    FeatureImpl() {
+    private static final Set<CmdClassifierType> ACKNOWLEDGEMENT_REQUEST_WHITELIST
+        = Set.of(WRITE, CALL);
+
+    FeatureImpl() {}
+
+    private NodeManagementImpl getNodeManagement() {
+        return ((NodeManagementImpl) getDevice().getNodeManagement());
     }
 
-    public boolean subscribe(NodeManagementSubscriptionRequestCallType.SubscriptionRequest subscriptionRequest) {
-        LOGGER.debug("Processing subscription request {}", subscriptionRequest);
+    public boolean subscribe(SubscriptionRequest subscriptionRequest) {
+        LOGGER.trace("Processing subscription request {}", subscriptionRequest);
         try {
             checkTrustLevel(subscriptionRequest.getClientAddress());
         }
@@ -60,8 +77,10 @@ class FeatureImpl implements Feature {
         }
         if ((role.equals(RoleType.SERVER) || role.equals(RoleType.SPECIAL))
             && featurePermission != null
-            && featurePermission.subscriptionAllowed(subscriptionRequest)) {
+            && featurePermission.subscriptionAllowed(subscriptionRequest)
+        ) {
             subscribers.add(subscriptionRequest.getClientAddress());
+
             LOGGER.debug("Subscription request accepted.");
             return true;
         }
@@ -96,7 +115,7 @@ class FeatureImpl implements Feature {
         this.bindingListeners.add(listener);
     }
 
-    public boolean bind(NodeManagementBindingRequestCallType.BindingRequest bindingRequest) {
+    public boolean bind(BindingRequest bindingRequest) {
         try {
             checkTrustLevel(bindingRequest.getClientAddress());
         }
@@ -112,26 +131,25 @@ class FeatureImpl implements Feature {
 
             // Doing this in parallel since we don't want to get stuck here
             bindingListeners
-                .parallelStream()
-                .forEach(listener -> listener.onBind(
-                    (NodeManagementBindingRequestCallType.BindingRequest) bindingRequest.clone()
-                ));
+                .forEach(listener ->
+                    bindingListenerExecutor.execute(
+                        () -> listener.onBind(
+                            (BindingRequest) bindingRequest.clone()))
+                );
 
-            LOGGER.debug("Binding request accepted");
+            LOGGER.debug(
+                "{} accepted binding request from {}",
+                this,
+                addressToString(bindingRequest.getClientAddress())
+            );
             return true;
         }
-        LOGGER.debug("Binding request denied");
+        LOGGER.debug(
+            "{} denied binding request from {}",
+            this,
+            addressToString(bindingRequest.getClientAddress())
+        );
         return false;
-    }
-
-    private String addressToString(FeatureAddressType address) {
-        StringBuilder addressString = new StringBuilder(address.getDevice() + ".");
-        for (Long entityId : address.getEntity()) {
-            addressString.append(entityId).append(".");
-        }
-        addressString.append(address.getFeature());
-
-        return addressString.toString();
     }
 
     public void read(DatagramType datagram) {
@@ -296,11 +314,16 @@ class FeatureImpl implements Feature {
     }
 
     private boolean isFunction(String nodeName) {
-        return !Objects.equals(nodeName, "function") && !Objects.equals(
+        return !Objects.equals(
+            nodeName,
+            "function"
+        ) && !Objects.equals(
             nodeName,
             "lastUpdateAt"
         ) && !Objects.equals(
-            nodeName, "manufacturerSpecificExtension") && !Objects.equals(
+            nodeName,
+            "manufacturerSpecificExtension"
+        ) && !Objects.equals(
             nodeName,
             "filter"
         );
@@ -342,18 +365,18 @@ class FeatureImpl implements Feature {
     }
 
     public void notify(DatagramType datagram) {
-        String addressString = addressToString(datagram
+        String address = addressToString(datagram
             .getHeader()
             .getAddressSource());
-        List<SpineSubscription> threadSafeCopy;
-        synchronized (subscriptions) {
-            threadSafeCopy = new ArrayList<>(subscriptions.getOrDefault(
-                addressString,
-                Collections.emptyList()
-            ));
+        if (subscriptions.containsKey(address)) {
+            RequestResultImpl notification = new RequestResultImpl(datagram);
+            subscriptions
+                .get(address)
+                .getSubscriptions()
+                .forEach(sub -> sub.messageReceived(notification));
         }
-        for (SpineSubscription subscription : threadSafeCopy) {
-            subscription.messageReceived(new RequestResultImpl(datagram));
+        else {
+            LOGGER.debug("No subscriptions for {} but got notification.", address);
         }
     }
 
@@ -418,7 +441,7 @@ class FeatureImpl implements Feature {
         functions.put(function.getFunctionName(), function);
         if (featureWrapper != null) featureWrapper.updateFunction(function);
         if (getDevice() != null) {
-            ((NodeManagementImpl) getDevice().getNodeManagement()).featureChanged(
+            getNodeManagement().featureChanged(
                 getAddress(),
                 function.getFunctionName()
             );
@@ -457,10 +480,8 @@ class FeatureImpl implements Feature {
 
         DatagramType datagram = completeDatagram(address, cmd, cmdClassifier);
 
-        CompletableFuture<RequestResult> future
-            = ((DeviceImpl) getDevice()).newRequest(datagram
-            .getHeader()
-            .getMsgCounter());
+        CompletableFuture<RequestResult> future= ((DeviceImpl) getDevice())
+            .newRequest(datagram);
 
         send(address, communicationAddress, datagram);
 
@@ -492,40 +513,25 @@ class FeatureImpl implements Feature {
          * But for now, we are.
          */
         ConnectionHandler connHandler = getDevice().getConnectionHandler();
-        if (Objects.equals(
-            address.getDevice(),
-            getDevice().getAddress().getDevice()
-        )) {
+        if (isUs(address)) {
             getDevice().parseDatagram(datagram);
         }
         else {
             if (communicationAddress == null) {
-                communicationAddress
-                    = connHandler.getCommunicationAddress(address.getDevice());
-                if (communicationAddress == null) {
-                    /* One might think that, if we have no communication address,
-                     * surely we cannot reach the destination device, and so we should
-                     * exit early.
-                     *
-                     * One would be wrong: at the very least in the test
-                     * suite, which uses a FakeCommunication implementation that does
-                     * no networking, a communication address for the destination
-                     * is not actually required. So all we can do is warn (and ignore
-                     * the warning when it comes up in tests)
-                     */
-                    // if you came here because you saw this warning in tests, you
-                    // can (probably) ignore it; see above explanation.
-                    LOGGER.warn(
-                        "Feature {} attempting to send to device {}, but could not find a communication address for that destination!",
-                        this,
-                        address.getDevice()
-                    );
-                }
+                communicationAddress = connHandler.getCommunicationAddress(
+                    address.getDevice());
             }
             SpineConnection connection = connHandler.newConnection(
-                communicationAddress);
+                communicationAddress
+            );
             connection.sendMessage(datagram);
         }
+    }
+
+    private boolean isUs(FeatureAddressType address) {
+        return Objects.equals(
+            address.getDevice(),
+            getDevice().getAddress().getDevice());
     }
 
     private DatagramType completeDatagram(
@@ -563,16 +569,27 @@ class FeatureImpl implements Feature {
     }
 
     @Override
-    public CompletableFuture<RequestResult> requestSubscription(
+    public synchronized CompletableFuture<RequestResult> requestSubscription(
         FeatureAddressType address,
         FeatureTypeEnumType featureType,
         SpineSubscription subscription
     ) {
-        if (subscriptionExists(address)) {
-            LOGGER.debug(
-                "Double subscription detected. Reusing existing subscription."
-            );
-            addSubscription(address, subscription, featureType);
+        String addressString = addressToString(address);
+        if(subscriptions.containsKey(addressString)) {
+            SubscriptionWrapper wrapper = subscriptions.get(addressString);
+            LOGGER.debug("Found existing subscription for {}", wrapper);
+            wrapper.addSubscription(subscription);
+
+            if (wrapper.getState() != PENDING && wrapper.getState() != SUCCESSFUL) {
+                LOGGER.debug(
+                    "Previous subscription request was unsuccessful. Retrying."
+                );
+                CompletableFuture<RequestResult> future
+                    = makeSubscriptionRequest(address, featureType);
+                wrapper.retry(future);
+                return future;
+            }
+
             SpineAcknowledgment ack = new SpineAcknowledgment(
                 Error.NO_ERROR,
                 "Reusing existing subscription"
@@ -580,23 +597,59 @@ class FeatureImpl implements Feature {
             HeaderType originalHeader = new HeaderType();
             originalHeader.setAddressSource(getAddress());
             originalHeader.setAddressDestination(address);
-            return CompletableFuture.completedFuture(
-                new RequestResultImpl(ack.getDatagram(getResultHeader(originalHeader))));
+
+            return CompletableFuture.completedFuture(new RequestResultImpl(
+                ack.getDatagram(getResultHeader(originalHeader))));
         }
-        CmdType cmd
-            = ((NodeManagementImpl) getDevice().getNodeManagement()).getSubscriptionRequest(
-            getAddress(),
-            address, featureType
-        );
-        CompletableFuture<RequestResult> future = request(
-            ((NodeManagementImpl) getDevice().getNodeManagement()).getNodeManagementAddress(
-                address.getDevice()),
-            cmd, CALL, null
-        );
+        else {
+            CompletableFuture<RequestResult> future = makeSubscriptionRequest(
+                address,
+                featureType
+            );
 
-        future.thenRun(() -> addSubscription(address, subscription, featureType));
+            subscriptions.put(
+                addressString,
+                new SubscriptionWrapper(
+                    subscription,
+                    address,
+                    featureType,
+                    future
+                )
+            );
 
-        return future;
+            return future;
+        }
+    }
+
+    private CompletableFuture<RequestResult> makeSubscriptionRequest(
+        FeatureAddressType address,
+        FeatureTypeEnumType featureType
+    ) {
+        NodeManagementImpl nodeManagement = getNodeManagement();
+
+        CmdType cmd = nodeManagement
+            .getSubscriptionRequest(
+                getAddress(),
+                address,
+                featureType
+            );
+
+        return request(
+            nodeManagement.getNodeManagementAddress(address.getDevice()),
+            cmd,
+            CALL,
+            null
+        ).whenComplete((result, error) -> {
+            if (error == null && result != null) {
+                getNodeManagement()
+                    .getFunction(SubscriptionDataFunction.class)
+                    .orElseThrow()
+                    .addSubscriptionEntry(
+                        this.getAddress(),
+                        address
+                    );
+            }
+        });
     }
 
     @Override
@@ -604,35 +657,52 @@ class FeatureImpl implements Feature {
         FeatureAddressType address,
         FeatureTypeEnumType featureType
     ) {
-        NodeManagementImpl nodeManagement
-            = (NodeManagementImpl) getDevice().getNodeManagement();
+        NodeManagementImpl nodeManagement = getNodeManagement();
+
         CmdType cmd = nodeManagement.getBindingRequest(
             getAddress(),
             address,
             featureType
         );
+
         return request(
             nodeManagement.getNodeManagementAddress(address.getDevice()),
             cmd,
             CALL,
             null
-        );
+        ).whenComplete((result, error) -> {
+            if (error == null && result != null) {
+                BindingRequest request = cmd
+                    .getNodeManagementBindingRequestCall()
+                    .getBindingRequest();
+
+                this.getNodeManagement().getFunction(BindingDataFunction.class)
+                    .orElseThrow().addBinding(request);
+            }
+        });
     }
 
     @Override
-    public void releaseSubscription(FeatureAddressType address) {
-        subscriptions.remove(addressToString(address));
-        NodeManagementImpl nodeManagement
-            = (NodeManagementImpl) getDevice().getNodeManagement();
-        nodeManagement.sendSubscriptionRelease(getAddress(), address);
+    public void releaseSubscription(FeatureAddressType serverAddress) {
+        subscriptions.remove(addressToString(serverAddress));
+
+        // Let's not start connections just to communicate a subscription release
+        if(getDevice().getConnectionHandler().getCommunicationAddress(
+            serverAddress.getDevice()) != null
+        ) {
+            getNodeManagement().sendSubscriptionRelease(getAddress(), serverAddress);
+        }
     }
 
     @Override
-    public void releaseSubscriber(FeatureAddressType subscriberAddress) {
-        removeSubscriber(subscriberAddress);
-        NodeManagementImpl nodeManagement
-            = (NodeManagementImpl) getDevice().getNodeManagement();
-        nodeManagement.sendSubscriptionRelease(subscriberAddress, getAddress());
+    public void releaseSubscriber(FeatureAddressType clientAddress) {
+        removeSubscriber(clientAddress);
+        // Let's not start connections just to communicate a subscription release
+        if(getDevice().getConnectionHandler().getCommunicationAddress(
+            clientAddress.getDevice()) != null
+        ) {
+            getNodeManagement().sendSubscriptionRelease(clientAddress, getAddress());
+        }
     }
 
     @Override
@@ -641,9 +711,13 @@ class FeatureImpl implements Feature {
             throw new UnsupportedOperationException();
         }
         removeBinding(clientAddress);
-        NodeManagementImpl nodeManagement
-            = (NodeManagementImpl) getDevice().getNodeManagement();
-        nodeManagement.sendBindingRelease(clientAddress, getAddress());
+
+        // Let's not start connections just to communicate a binding release
+        if(getDevice().getConnectionHandler().getCommunicationAddress(
+            clientAddress.getDevice()) != null
+        ) {
+            getNodeManagement().sendBindingRelease(clientAddress, getAddress());
+        }
     }
 
     @Override
@@ -651,9 +725,7 @@ class FeatureImpl implements Feature {
         if (role.equals(RoleType.SERVER)) {
             throw new UnsupportedOperationException();
         }
-        NodeManagementImpl nodeManagement
-            = (NodeManagementImpl) getDevice().getNodeManagement();
-        nodeManagement.sendBindingRelease(getAddress(), serverAddress);
+        getNodeManagement().sendBindingRelease(getAddress(), serverAddress);
     }
 
     @Override
@@ -713,72 +785,17 @@ class FeatureImpl implements Feature {
     }
 
     public void removeSubscriber(FeatureAddressType subscriberAddress) {
-        subscribers.removeIf(
-            subscriber -> subscriber
-                .getDevice()
-                .equals(subscriberAddress.getDevice()) && subscriber.getFeature()
-                .equals(subscriberAddress.getFeature()) && subscriber.getEntity()
-                .equals(subscriberAddress.getEntity()
-                ));
-    }
-
-    public CompletableFuture<RequestResult> requestSubscription(
-        FeatureAddressType address,
-        FeatureTypeEnumType featureType,
-        SpineSubscription subscription,
-        String communicationAddress
-    ) {
-        CmdType cmd
-            = ((NodeManagementImpl) getDevice().getNodeManagement())
-            .getSubscriptionRequest(
-                getAddress(),
-                address,
-                featureType
-        );
-        CompletableFuture<RequestResult> future = request(
-            ((NodeManagementImpl) getDevice().getNodeManagement())
-                .getNodeManagementAddress(null),
-            cmd,
-            CALL,
-            communicationAddress
-        );
-        future.thenAccept(result -> {
-            address.setDevice(result.getSenderAddress().getDevice());
-            addSubscription(address, subscription, featureType);
-        });
-
-        return future;
-    }
-
-    private boolean subscriptionExists(FeatureAddressType address) {
-        return subscriptions.containsKey(addressToString(address));
-    }
-
-    private void addSubscription(
-        FeatureAddressType address,
-        SpineSubscription subscription,
-        FeatureTypeEnumType serverFeatureType
-    ) {
-        String addressString = addressToString(address);
-        if (subscriptions.containsKey(addressString)) {
-            List<SpineSubscription> subscriptionList = subscriptions.get(addressString);
-
-            if (!subscriptionList.contains(subscription)) {
-                subscriptionList.add(subscription);
-            }
-        }
-        else {
-            List<SpineSubscription> list = new ArrayList<>(1);
-            list.add(subscription);
-            subscriptions.put(addressString, list);
-            NodeManagementImpl nodeManagement
-                = (NodeManagementImpl) getDevice().getNodeManagement();
-            nodeManagement.registerSubscriptionRequest(
-                getAddress(),
-                address,
-                serverFeatureType
-            );
-        }
+        subscribers.removeIf(subscriber ->
+            Objects.equals(
+                subscriber.getDevice(),
+                subscriberAddress.getDevice())
+            && Objects.equals(
+                subscriber.getFeature(),
+                subscriberAddress.getFeature())
+            && Objects.equals(
+                subscriber.getEntity(),
+                subscriberAddress.getEntity()
+        ));
     }
 
     public CompletableFuture<RequestResult> requestCall(
@@ -902,27 +919,28 @@ class FeatureImpl implements Feature {
         return null;
     }
 
+    SubscriptionWrapper getSubscription(FeatureAddressType address) {
+        return this.subscriptions.get(addressToString(address));
+    }
+
+    boolean getBound(FeatureAddressType address) {
+        return this.bindings.contains(addressToString(address));
+    }
+
+    boolean getSubscribed(FeatureAddressType address) {
+        return this.subscribers.contains(address);
+    }
+
     @Override
     public void shutdown() {
         for (FeatureFunction function : functions.values()) {
             function.close();
         }
+        bindingListenerExecutor.shutdown();
     }
 
     @Override
     public String toString() {
-        return "FeatureImpl{" +
-                "functions=" + functions +
-                ", address=" + address +
-                ", subscribers=" + subscribers +
-                ", featureType=" + featureType +
-                ", role=" + role +
-                ", label='" + label + '\'' +
-                ", description='" + description + '\'' +
-                ", group='" + group + '\'' +
-                ", minimumTrustLevel='" + minimumTrustLevel + '\'' +
-                ", featurePermission=" + featurePermission +
-                ", bindings=" + bindings +
-                '}';
+        return role+" "+featureType+" at "+addressToString(getAddress());
     }
 }
