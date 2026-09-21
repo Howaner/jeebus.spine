@@ -107,6 +107,13 @@ public class ShipCommunication extends Communication {
         return connected;
     }
 
+    public List<ShipConnectionInfoSnapshot> getConnectionInfos() {
+        if (ship == null) {
+            return new ArrayList<>();
+        }
+        return ship.getConnectionInfos();
+    }
+
     @Override
     public SpineConnection open(String address) {
         try {
@@ -323,14 +330,6 @@ public class ShipCommunication extends Communication {
                 .registerConnection(new ShipSpineConnection(connection));
 
             addDevice(connection.getRemoteId());
-        }
-    }
-
-    public List<ShipConnectionInfoSnapshot> getConnectionInfos() {
-        if (Objects.nonNull(ship)) {
-            return ship.getConnectionInfos();
-        } else {
-            return new ArrayList<>();
         }
     }
 }
