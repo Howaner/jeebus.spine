@@ -107,6 +107,10 @@ public class ShipCommunication extends Communication {
         return connected;
     }
 
+    /**
+     * @return {@link Ship#getConnectionInfos()} or an empty List if ship is
+     * {@code null}
+     */
     public List<ShipConnectionInfoSnapshot> getConnectionInfos() {
         if (ship == null) {
             return new ArrayList<>();

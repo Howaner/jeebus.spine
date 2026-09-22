@@ -1,5 +1,16 @@
 # Changelog
 
+## [4.2.0] - 2026-09-21
+
+### Added
+
+- Add `ShipCommunication#getConnectionInfos` to get a snapshot of all current SHIP
+  connections
+
+### Changed
+
+- update jEEBus.SHIP dependency to 3.2.0
+
 ## [4.1.1] - 2026-09-09
 
 ### Changed
