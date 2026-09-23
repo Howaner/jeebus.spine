@@ -11,8 +11,6 @@
 package org.openmuc.jeebus.shipspine;
 
 import org.openmuc.jeebus.ship.api.*;
-import org.openmuc.jeebus.ship.node.ShipConfig;
-import org.openmuc.jeebus.ship.util.ShipUtilities;
 import org.openmuc.jeebus.spine.impl.parser.MessageParser;
 import org.openmuc.jeebus.spine.spi.Communication;
 import org.openmuc.jeebus.spine.spi.SpineConnection;
