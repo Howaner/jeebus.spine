@@ -247,4 +247,10 @@ public class LimitListDataFunction extends LoadControlFeatureFunction<
     ) throws SpineException {
 
     }
+
+    @Override
+    public void close() {
+        super.close();
+        executor.shutdown();
+    }
 }
